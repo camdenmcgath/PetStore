@@ -5,9 +5,7 @@ IF NOT EXISTS(SELECT 1 FROM sys.schemas WHERE name = 'pet')
 	EXEC sp_executesql N'CREATE SCHEMA pet'
 GO
 
-USE cmcgath
-GO
---TODO: consider temp tables for dropping
+--drop tables in correct order due to foreign key dependencies
 IF EXISTS(SELECT 1 FROM sys.tables WHERE name = 'AnimalPurchases')
 BEGIN
 	ALTER TABLE  pet.AnimalPurchases NOCHECK CONSTRAINT ALL
@@ -62,19 +60,20 @@ BEGIN
 		, StoreLocation varchar(50) NOT NULL
 		, StorageContainer varchar(50) NOT NULL
 	)
+
 END
 GO
 
 --reasonable to know type (dog) from breed (poodle)
---discount determined by animal type and breed
+--discount eligibility determined by animal type and breed
 IF NOT EXISTS(SELECT 1 FROM sys.tables WHERE name = 'AnimalBreed')
 BEGIN
 	CREATE TABLE pet.AnimalBreed(
 		AnimalBreed varchar(50) PRIMARY KEY NOT NULL
 		, AnimalType varchar(50) FOREIGN KEY REFERENCES pet.AnimalType NOT NULL
-		, PossibleDiscount bit NOT NULL --TODO: normalize
-
+		, PossibleDiscount bit NOT NULL
 	)
+
 END
 GO
 
@@ -86,7 +85,7 @@ BEGIN
 		, AnimalName varchar(50) NOT NULL
 		, DateOfBirth date NOT NULL
 		, AnimalBreed varchar(50) FOREIGN KEY REFERENCES pet.AnimalBreed NOT NULL
-		, ListPrice money NOT NULL
+		, ListPrice money NOT NULL --undiscounted price of specific animal
 		, Fixed bit NOT NULL
 		, Sex char(1) NOT NULL
 
@@ -94,6 +93,7 @@ BEGIN
 END
 GO
 
+--archive table to separate purchased animals from ones currently in inventory
 IF NOT EXISTS(SELECT 1 FROM sys.tables WHERE name = 'PurchasedAnimals')
 BEGIN
 	CREATE TABLE pet.PurchasedAnimals(
@@ -109,7 +109,6 @@ BEGIN
 END
 GO
 
---assume customers can purchase more than one animal per transaction?
 --CustomerID is a unique customer number assigned by the store at checkout
 IF NOT EXISTS(SELECT 1 FROM sys.tables WHERE name = 'Customers')
 BEGIN
@@ -124,7 +123,7 @@ BEGIN
 END
 GO
 
---for this store, each purchase represents the pruchase of one animal
+--for this store, each purchase represents the pruchase of one animal by a customer
 IF NOT EXISTS(SELECT 1 FROM sys.tables WHERE name = 'AnimalPurchases')
 BEGIN
 	CREATE TABLE pet.AnimalPurchases(
@@ -132,7 +131,7 @@ BEGIN
 		, CustomerID int FOREIGN KEY REFERENCES pet.Customers NOT NULL
 		, AnimalID int FOREIGN KEY REFERENCES pet.PurchasedAnimals NOT NULL
 		, PurchaseDate date NOT NULL
-		, PurchasePrice money NOT NULL
+		, PurchasePrice money NOT NULL --price after potential discount
 	)
 END
 GO
@@ -373,10 +372,6 @@ BEGIN
 END
 GO
 
---no need to upsert because transactions could be identical theoretically
---only differ by purchase ID identity
---insert and delete by ID and update by ID will all be separate for this reason
-
 CREATE OR ALTER PROC pet.AddTransaction(
 	@AnimalID int
 	, @PurchaseDate date
@@ -422,7 +417,6 @@ BEGIN
 		IF @PossibleDiscount = 1
 		BEGIN
 			SET @PurchasePrice = ROUND(@PurchasePrice * 0.9, 2)
-			PRINT 'adjusted!'
 		END
 
 
@@ -466,20 +460,51 @@ INNER JOIN pet.AnimalType t ON b.AnimalType=t.AnimalType
 GO
 
 CREATE OR ALTER VIEW pet.vw_PurchaseDetails AS
-SELECT ap.*, c.FirstName, c.LastName, c.PhoneNumber, c.Email, 
+SELECT ap.PurchaseID, ap.PurchaseDate, ap.PurchasePrice, c.FirstName, c.LastName, c.PhoneNumber, c.Email, 
 	pa.AnimalName, pa.AnimalType, pa.AnimalBreed, pa.DateOfBirth
 FROM pet.AnimalPurchases ap
 INNER JOIN pet.vw_PurchasedAnimals pa ON ap.AnimalID=pa.AnimalID
 INNER JOIN pet.Customers c ON c.CustomerID=ap.CustomerID
 GO
 
+CREATE OR ALTER VIEW pet.vw_AnimalPurchasesByMonth AS
+    SELECT 
+        YEAR(PurchaseDate) PurchaseYear 
+        , MONTH(PurchaseDate) PurchaseMonth 
+        , aty.AnimalType
+        , ab.AnimalBreed 
+        , COUNT(*) AS Purchases 
+        , SUM(PurchasePrice) AS Revenue
+    FROM 
+        pet.AnimalPurchases ap
+        JOIN pet.PurchasedAnimals pa ON ap.AnimalID = pa.AnimalID 
+        JOIN pet.AnimalBreed ab ON pa.AnimalBreed = ab.AnimalBreed 
+        JOIN pet.AnimalType aty ON ab.AnimalType = aty.AnimalType
+    GROUP BY 
+        YEAR(PurchaseDate) 
+        , MONTH(PurchaseDate) 
+        , aty.AnimalType 
+        , ab.AnimalBreed
+GO
 
---TODO: report showing purchases by month for each type/breed of animal along with
---a summary showing total revenue overall by animal.
---TODO: test Deletes 
+-- Create a view to show total revenue overall by animal
+CREATE OR ALTER VIEW pet.vw_AnimalTotalRevenue AS
+    SELECT 
+        aty.AnimalType 
+        , ab.AnimalBreed 
+        , SUM(PurchasePrice) TotalRevenue
+    FROM 
+        pet.AnimalPurchases ap
+        JOIN pet.PurchasedAnimals pa ON ap.AnimalID = pa.AnimalID 
+        JOIN pet.AnimalBreed ab ON pa.AnimalBreed = ab.AnimalBreed 
+        JOIN pet.AnimalType aty ON ab.AnimalType = aty.AnimalType
+	GROUP BY
+		aty.AnimalType
+		, ab.AnimalBreed
+GO
 
 -----------------------------------------------
-------DEAL WITH INDEXES-------------------------
+------DEAL WITH INDEXES------------------------
 -----------------------------------------------
 
 --add some additional non-clustered indexes
@@ -592,8 +617,6 @@ EXEC pet.UpsertAnimal
 	, 0
 	, 'M'
 
-SELECT * FROM pet.vw_AnimalInventory;
-SELECT * FROM pet.vw_PurchasedAnimals
 EXEC pet.UpsertCustomer
 	6811
 	, 'John'
@@ -618,15 +641,15 @@ EXEC pet.AddTransaction
 	, '2015-01-23'
 	, 6811
 
-
 SELECT * FROM pet.vw_AnimalInventory;
 SELECT * FROM pet.vw_PurchasedAnimals;
 SELECT * FROM pet.vw_PurchaseDetails;
-
+SELECT * FROM pet.vw_AnimalPurchasesByMonth;
+SELECT * FROM pet.vw_AnimalTotalRevenue;
 --Oops! issue with the animal, needs be removed from inventory (not purchased)
 EXEC pet.DeleteAnimalByID
 	3
 
-	SELECT * FROM pet.vw_AnimalInventory
+SELECT * FROM pet.vw_AnimalInventory
 --assume never necessary to delete customer, always good to have their info
 --assume never necessary to delete a purchase as there are no refunds (purchases are final once they go through)
